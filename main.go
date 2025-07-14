@@ -3,8 +3,9 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/xhkzeroone/go-eventbus/eventbus"
 	"time"
+
+	"github.com/xhkzeroone/go-eventbus/eventbus"
 )
 
 type AddRequest struct {
@@ -36,14 +37,36 @@ func RejectEmptyMiddleware(next eventbus.HandlerFunc) eventbus.HandlerFunc {
 }
 
 func main() {
-	bus := eventbus.NewEventBus("localhost:6379")
+	// Chọn engine: "redis" hoặc "rabbitmq"
+	// engine := "redis" // hoặc "rabbitmq"
+	// if len(os.Args) > 1 {
+	// 	engine = os.Args[1]
+	// }
+
+	var bus eventbus.EventBus
+	var err error
+
+	// if engine == "redis" {
+	//bus = eventbus.NewRedisEventBus("localhost:6379")
+	//fmt.Println("[EventBus] Sử dụng Redis")
+	// } else if engine == "rabbitmq" {
+	bus, err = eventbus.NewRabbitMQEventBus("amqp://guest:guest@localhost:5672/")
+	if err != nil {
+		fmt.Println("Không kết nối được RabbitMQ:", err)
+		return
+	}
+	//fmt.Println("[EventBus] Sử dụng RabbitMQ")
+	// } else {
+	// 	fmt.Println("Engine không hỗ trợ:", engine)
+	// 	return
+	// }
 
 	// Gắn middleware
 	bus.Use(LoggingMiddleware)
 	bus.Use(RejectEmptyMiddleware)
 
 	// Đăng ký handler cho math.add
-	bus.Handle("math.add", func(data json.RawMessage) any {
+	bus.Receive("math.add", func(data json.RawMessage) any {
 		var req AddRequest
 		_ = json.Unmarshal(data, &req)
 		return AddResponse{Result: req.A + req.B}
