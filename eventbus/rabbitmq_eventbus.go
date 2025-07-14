@@ -74,6 +74,43 @@ func (eb *rabbitmqEventBus) Publish(topic string, payload any) error {
 	)
 }
 
+// subscribeQueue dành cho reply queue (auto-delete, exclusive, không durable)
+func (eb *rabbitmqEventBus) subscribeQueue(queue string, handler func(message []byte)) (string, error) {
+	q, err := eb.ch.QueueDeclare(
+		queue,
+		false, // durable
+		true,  // auto-delete
+		true,  // exclusive
+		false, // no-wait
+		nil,   // args
+	)
+	if err != nil {
+		return "", err
+	}
+	deliveries, err := eb.ch.Consume(
+		q.Name,
+		"",    // consumer
+		true,  // auto-ack
+		true,  // exclusive
+		false, // no-local
+		false, // no-wait
+		nil,   // args
+	)
+	if err != nil {
+		return "", err
+	}
+	id := uuid.NewString()
+	ch := make(chan amqp.Delivery)
+	eb.subscriber.Store(id, ch)
+	go func() {
+		for d := range deliveries {
+			handler(d.Body)
+		}
+	}()
+	return id, nil
+}
+
+// Subscribe dành cho topic public (durable, không auto-delete, không exclusive)
 func (eb *rabbitmqEventBus) Subscribe(topic string, handler func(message []byte)) (string, error) {
 	q, err := eb.ch.QueueDeclare(
 		topic,
@@ -147,7 +184,7 @@ func (eb *rabbitmqEventBus) Send(topic string, payload any, timeout time.Duratio
 	respChan := make(chan json.RawMessage, 1)
 	eb.subscriber.Store(correlationID, respChan)
 	// Đăng ký nhận reply
-	_, err := eb.Subscribe(replyTo, func(msg []byte) {
+	_, err := eb.subscribeQueue(replyTo, func(msg []byte) {
 		var env Envelope
 		if err := json.Unmarshal(msg, &env); err != nil {
 			log.Println("unmarshal reply envelope error:", err)

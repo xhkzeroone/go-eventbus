@@ -37,29 +37,17 @@ func RejectEmptyMiddleware(next eventbus.HandlerFunc) eventbus.HandlerFunc {
 }
 
 func main() {
-	// Chọn engine: "redis" hoặc "rabbitmq"
-	// engine := "redis" // hoặc "rabbitmq"
-	// if len(os.Args) > 1 {
-	// 	engine = os.Args[1]
-	// }
-
 	var bus eventbus.EventBus
-	var err error
 
-	// if engine == "redis" {
-	//bus = eventbus.NewRedisEventBus("localhost:6379")
-	//fmt.Println("[EventBus] Sử dụng Redis")
-	// } else if engine == "rabbitmq" {
-	bus, err = eventbus.NewRabbitMQEventBus("amqp://guest:guest@localhost:5672/")
-	if err != nil {
-		fmt.Println("Không kết nối được RabbitMQ:", err)
-		return
-	}
-	//fmt.Println("[EventBus] Sử dụng RabbitMQ")
-	// } else {
-	// 	fmt.Println("Engine không hỗ trợ:", engine)
-	// 	return
-	// }
+	bus = eventbus.NewRedisEventBus("localhost:6379")
+	fmt.Println("[EventBus] Sử dụng Redis")
+
+	//var err error
+	//bus, err = eventbus.NewRabbitMQEventBus("amqp://guest:guest@localhost:5672/")
+	//if err != nil {
+	//	fmt.Println("Không kết nối được RabbitMQ:", err)
+	//	return
+	//}
 
 	// Gắn middleware
 	bus.Use(LoggingMiddleware)
