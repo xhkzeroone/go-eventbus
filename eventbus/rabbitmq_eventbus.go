@@ -12,18 +12,13 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-// rabbitmqEventBus implement EventBus cho RabbitMQ
-// Không export struct này ra ngoài
-// Sử dụng NewRabbitMQEventBus để khởi tạo
-
 type rabbitmqEventBus struct {
 	conn        *amqp.Connection
 	ch          *amqp.Channel
 	middlewares []MiddlewareFunc
-	subscriber  sync.Map // map[string]chan amqp.Delivery
+	subscriber  sync.Map // map[string]chan or replyConsumer
 }
 
-// NewRabbitMQEventBus khởi tạo event bus mới với RabbitMQ
 func NewRabbitMQEventBus(dsn string) (EventBus, error) {
 	conn, err := amqp.Dial(dsn)
 	if err != nil {
@@ -64,7 +59,7 @@ func (eb *rabbitmqEventBus) Publish(topic string, payload any) error {
 	}
 	return eb.ch.Publish(
 		"",    // exchange
-		topic, // routing key (queue name)
+		topic, // routing key
 		false, // mandatory
 		false, // immediate
 		amqp.Publishing{
@@ -80,86 +75,91 @@ type replyConsumer struct {
 	channel     *amqp.Channel
 }
 
-// subscribeQueue dành cho reply queue (auto-delete, exclusive, không durable)
 func (eb *rabbitmqEventBus) subscribeQueue(queue string, handler func(message []byte)) (string, error) {
 	q, err := eb.ch.QueueDeclare(
 		queue,
 		false, // durable
 		true,  // auto-delete
 		true,  // exclusive
-		false, // no-wait
-		nil,   // args
+		false,
+		nil,
 	)
 	if err != nil {
 		return "", err
 	}
-	// Tạo channel riêng cho consumer này để có thể cancel
+
 	ch, err := eb.conn.Channel()
 	if err != nil {
 		return "", err
 	}
+
 	consumerTag := uuid.NewString()
 	deliveries, err := ch.Consume(
 		q.Name,
-		consumerTag, // consumer tag
-		true,        // auto-ack
-		true,        // exclusive
-		false,       // no-local
-		false,       // no-wait
-		nil,         // args
+		consumerTag,
+		true, // auto-ack
+		true, // exclusive
+		false,
+		false,
+		nil,
 	)
 	if err != nil {
 		ch.Close()
 		return "", err
 	}
+
 	id := uuid.NewString()
 	eb.subscriber.Store(id, &replyConsumer{id: id, consumerTag: consumerTag, channel: ch})
+
 	go func() {
 		for d := range deliveries {
 			handler(d.Body)
 		}
 	}()
+
 	return id, nil
 }
 
-// Subscribe dành cho topic public (durable, không auto-delete, không exclusive)
 func (eb *rabbitmqEventBus) Subscribe(topic string, handler func(message []byte)) (string, error) {
 	q, err := eb.ch.QueueDeclare(
 		topic,
 		true,  // durable
 		false, // auto-delete
 		false, // exclusive
-		false, // no-wait
-		nil,   // args
+		false,
+		nil,
 	)
 	if err != nil {
 		return "", err
 	}
+
 	deliveries, err := eb.ch.Consume(
 		q.Name,
-		"",    // consumer
+		"",    // consumer tag
 		true,  // auto-ack
 		false, // exclusive
-		false, // no-local
-		false, // no-wait
-		nil,   // args
+		false,
+		false,
+		nil,
 	)
 	if err != nil {
 		return "", err
 	}
+
 	id := uuid.NewString()
-	ch := make(chan amqp.Delivery)
-	eb.subscriber.Store(id, ch)
+	// Không lưu channel vì không dùng đến
+	eb.subscriber.Store(id, true)
+
 	go func() {
 		for d := range deliveries {
 			handler(d.Body)
 		}
 	}()
+
 	return id, nil
 }
 
 func (eb *rabbitmqEventBus) Unsubscribe(id string) error {
-	// Nếu là replyConsumer thì cancel consumer và đóng channel
 	if v, ok := eb.subscriber.Load(id); ok {
 		if rc, ok := v.(*replyConsumer); ok {
 			_ = rc.channel.Cancel(rc.consumerTag, false)
@@ -198,9 +198,12 @@ func (eb *rabbitmqEventBus) Receive(topic string, handler HandlerFunc) error {
 func (eb *rabbitmqEventBus) Send(topic string, payload any, timeout time.Duration) (json.RawMessage, error) {
 	replyTo := "reply_" + uuid.NewString()
 	correlationID := uuid.NewString()
+
 	respChan := make(chan json.RawMessage, 1)
 	eb.subscriber.Store(correlationID, respChan)
-	// Đăng ký nhận reply, lưu lại id để hủy đúng consumer
+	defer eb.subscriber.Delete(correlationID)
+	defer close(respChan)
+
 	replyConsumerID, err := eb.subscribeQueue(replyTo, func(msg []byte) {
 		var env Envelope
 		if err := json.Unmarshal(msg, &env); err != nil {
@@ -209,40 +212,46 @@ func (eb *rabbitmqEventBus) Send(topic string, payload any, timeout time.Duratio
 		}
 		if ch, ok := eb.subscriber.Load(env.CorrelationID); ok {
 			if c, ok := ch.(chan json.RawMessage); ok {
-				c <- env.Data
+				select {
+				case c <- env.Data:
+				default:
+					log.Println("warning: response channel is full, dropping reply")
+				}
 			}
 		}
 	})
 	if err != nil {
 		return nil, err
 	}
+	defer func(eb *rabbitmqEventBus, id string) {
+		_ = eb.Unsubscribe(id)
+	}(eb, replyConsumerID)
+
 	msgBytes, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("marshal payload error: %w", err)
 	}
+
 	env := Envelope{
 		EventName:     topic,
 		Data:          msgBytes,
 		ReplyTo:       replyTo,
 		CorrelationID: correlationID,
 	}
+
 	envBytes, err := json.Marshal(env)
 	if err != nil {
 		return nil, fmt.Errorf("marshal envelope error: %w", err)
 	}
+
 	if err := eb.Publish(topic, envBytes); err != nil {
-		_ = eb.Unsubscribe(replyConsumerID)
 		return nil, err
 	}
-	var resp json.RawMessage
+
 	select {
-	case resp = <-respChan:
-		_ = eb.Unsubscribe(replyConsumerID)
-		eb.subscriber.Delete(correlationID)
+	case resp := <-respChan:
+		return resp, nil
 	case <-time.After(timeout):
-		_ = eb.Unsubscribe(replyConsumerID)
-		eb.subscriber.Delete(correlationID)
 		return nil, errors.New("timeout waiting for reply")
 	}
-	return resp, nil
 }

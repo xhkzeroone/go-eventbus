@@ -13,10 +13,6 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// redisEventBus implement EventBus cho Redis
-// Không export struct này ra ngoài
-// Sử dụng NewRedisEventBus để khởi tạo
-
 type redisEventBus struct {
 	client      *redis.Client
 	ctx         context.Context
@@ -25,7 +21,6 @@ type redisEventBus struct {
 	pubsubs     sync.Map // map[string]*redis.PubSub
 }
 
-// NewRedisEventBus khởi tạo event bus mới với Redis
 func NewRedisEventBus(addr string) EventBus {
 	rdb := redis.NewClient(&redis.Options{
 		Addr: addr,
@@ -117,7 +112,13 @@ func (eb *redisEventBus) Send(topic string, payload any, timeout time.Duration) 
 	replyTo := "reply_" + uuid.NewString()
 	correlationID := uuid.NewString()
 	respChan := make(chan json.RawMessage, 1)
+
+	// Lưu subscriber channel để reply sẽ đưa dữ liệu vào đây
 	eb.subscriber.Store(correlationID, respChan)
+	defer eb.subscriber.Delete(correlationID)
+	defer close(respChan)
+
+	// Handler nhận reply
 	handleFunc := func(msg []byte) {
 		var env Envelope
 		if err := json.Unmarshal(msg, &env); err != nil {
@@ -130,10 +131,18 @@ func (eb *redisEventBus) Send(topic string, payload any, timeout time.Duration) 
 			}
 		}
 	}
+
+	// Đăng ký channel reply
 	id, err := eb.Subscribe(replyTo, handleFunc)
 	if err != nil {
 		return nil, err
 	}
+
+	defer func(eb *redisEventBus, id string) {
+		_ = eb.Unsubscribe(id)
+	}(eb, id)
+
+	// Gửi request với envelope
 	msgBytes, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("marshal payload error: %w", err)
@@ -151,15 +160,11 @@ func (eb *redisEventBus) Send(topic string, payload any, timeout time.Duration) 
 	if err := eb.client.Publish(eb.ctx, topic, envBytes).Err(); err != nil {
 		return nil, err
 	}
-	var resp json.RawMessage
+
 	select {
-	case resp = <-respChan:
-		eb.subscriber.Delete(correlationID)
+	case resp := <-respChan:
+		return resp, nil
 	case <-time.After(timeout):
-		eb.subscriber.Delete(correlationID)
-		_ = eb.Unsubscribe(id)
 		return nil, errors.New("timeout waiting for reply")
 	}
-	_ = eb.Unsubscribe(id)
-	return resp, nil
 }

@@ -39,7 +39,10 @@ func RejectEmptyMiddleware(next eventbus.HandlerFunc) eventbus.HandlerFunc {
 func main() {
 	var bus eventbus.EventBus
 
-	bus = eventbus.NewRedisEventBus("localhost:6379")
+	//bus = eventbus.NewRedisStreamEventBus("localhost:6379")
+	//fmt.Println("[EventBus] Sử dụng Redis")
+
+	bus = eventbus.NewRedisStreamEventBus("localhost:6379", "my-consumer-group")
 	fmt.Println("[EventBus] Sử dụng Redis")
 
 	//var err error
