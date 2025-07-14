@@ -74,6 +74,12 @@ func (eb *rabbitmqEventBus) Publish(topic string, payload any) error {
 	)
 }
 
+type replyConsumer struct {
+	id          string
+	consumerTag string
+	channel     *amqp.Channel
+}
+
 // subscribeQueue dành cho reply queue (auto-delete, exclusive, không durable)
 func (eb *rabbitmqEventBus) subscribeQueue(queue string, handler func(message []byte)) (string, error) {
 	q, err := eb.ch.QueueDeclare(
@@ -87,21 +93,27 @@ func (eb *rabbitmqEventBus) subscribeQueue(queue string, handler func(message []
 	if err != nil {
 		return "", err
 	}
-	deliveries, err := eb.ch.Consume(
-		q.Name,
-		"",    // consumer
-		true,  // auto-ack
-		true,  // exclusive
-		false, // no-local
-		false, // no-wait
-		nil,   // args
-	)
+	// Tạo channel riêng cho consumer này để có thể cancel
+	ch, err := eb.conn.Channel()
 	if err != nil {
 		return "", err
 	}
+	consumerTag := uuid.NewString()
+	deliveries, err := ch.Consume(
+		q.Name,
+		consumerTag, // consumer tag
+		true,        // auto-ack
+		true,        // exclusive
+		false,       // no-local
+		false,       // no-wait
+		nil,         // args
+	)
+	if err != nil {
+		ch.Close()
+		return "", err
+	}
 	id := uuid.NewString()
-	ch := make(chan amqp.Delivery)
-	eb.subscriber.Store(id, ch)
+	eb.subscriber.Store(id, &replyConsumer{id: id, consumerTag: consumerTag, channel: ch})
 	go func() {
 		for d := range deliveries {
 			handler(d.Body)
@@ -147,9 +159,14 @@ func (eb *rabbitmqEventBus) Subscribe(topic string, handler func(message []byte)
 }
 
 func (eb *rabbitmqEventBus) Unsubscribe(id string) error {
-	// RabbitMQ không hỗ trợ hủy consumer qua API đơn giản, cần close channel hoặc consumer tag
-	// Để đơn giản, ta chỉ xóa khỏi map
-	eb.subscriber.Delete(id)
+	// Nếu là replyConsumer thì cancel consumer và đóng channel
+	if v, ok := eb.subscriber.Load(id); ok {
+		if rc, ok := v.(*replyConsumer); ok {
+			_ = rc.channel.Cancel(rc.consumerTag, false)
+			_ = rc.channel.Close()
+		}
+		eb.subscriber.Delete(id)
+	}
 	return nil
 }
 
@@ -183,8 +200,8 @@ func (eb *rabbitmqEventBus) Send(topic string, payload any, timeout time.Duratio
 	correlationID := uuid.NewString()
 	respChan := make(chan json.RawMessage, 1)
 	eb.subscriber.Store(correlationID, respChan)
-	// Đăng ký nhận reply
-	_, err := eb.subscribeQueue(replyTo, func(msg []byte) {
+	// Đăng ký nhận reply, lưu lại id để hủy đúng consumer
+	replyConsumerID, err := eb.subscribeQueue(replyTo, func(msg []byte) {
 		var env Envelope
 		if err := json.Unmarshal(msg, &env); err != nil {
 			log.Println("unmarshal reply envelope error:", err)
@@ -214,13 +231,16 @@ func (eb *rabbitmqEventBus) Send(topic string, payload any, timeout time.Duratio
 		return nil, fmt.Errorf("marshal envelope error: %w", err)
 	}
 	if err := eb.Publish(topic, envBytes); err != nil {
+		_ = eb.Unsubscribe(replyConsumerID)
 		return nil, err
 	}
 	var resp json.RawMessage
 	select {
 	case resp = <-respChan:
+		_ = eb.Unsubscribe(replyConsumerID)
 		eb.subscriber.Delete(correlationID)
 	case <-time.After(timeout):
+		_ = eb.Unsubscribe(replyConsumerID)
 		eb.subscriber.Delete(correlationID)
 		return nil, errors.New("timeout waiting for reply")
 	}
